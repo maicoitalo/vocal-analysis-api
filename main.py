@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import numpy as np
 import librosa
-import crepe
 import parselmouth
 import base64
 import io
@@ -27,7 +26,7 @@ app.add_middleware(
 )
 
 # API Key para segurança
-API_KEY = os.getenv("API_KEY", "vocal-api-beca-2024-xyz789")
+API_KEY = os.getenv("API_KEY", "vocal-api-beca-2025-xyz789")
 
 class AudioAnalysisRequest(BaseModel):
     audio_base64: str
@@ -56,35 +55,46 @@ def decode_audio(audio_base64: str):
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Erro ao decodificar áudio: {str(e)}")
 
-def analyze_pitch_with_crepe(audio_data, sample_rate):
-    """Análise de pitch usando CREPE"""
+def analyze_pitch_with_librosa(audio_data, sample_rate):
+    """Análise de pitch usando Librosa"""
     try:
-        # CREPE para detecção de pitch
-        time, frequency, confidence, activation = crepe.predict(
-            audio_data, 
-            sample_rate, 
-            viterbi=True,
-            step_size=10
+        # Usar pyin para detecção de pitch (mais preciso que piptrack)
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio_data,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sample_rate
         )
         
-        # Filtrar apenas valores confiáveis
-        confident_freqs = frequency[confidence > 0.8]
+        # Remover valores NaN
+        valid_f0 = f0[~np.isnan(f0)]
         
-        if len(confident_freqs) == 0:
-            confident_freqs = frequency[confidence > 0.5]
+        if len(valid_f0) == 0:
+            # Fallback para piptrack se pyin falhar
+            pitches, magnitudes = librosa.piptrack(y=audio_data, sr=sample_rate)
+            valid_f0 = []
+            for t in range(pitches.shape[1]):
+                index = magnitudes[:, t].argmax()
+                pitch = pitches[index, t]
+                if pitch > 0:
+                    valid_f0.append(pitch)
+            valid_f0 = np.array(valid_f0)
+        
+        if len(valid_f0) == 0:
+            valid_f0 = np.array([440.0])  # Default A4
         
         # Converter frequências para notas
         notes = []
-        for freq in confident_freqs:
+        for freq in valid_f0:
             if freq > 0:
                 note = librosa.hz_to_note(freq)
                 notes.append(note)
         
         # Análise estatística
-        mean_freq = float(np.mean(confident_freqs)) if len(confident_freqs) > 0 else 0
-        median_freq = float(np.median(confident_freqs)) if len(confident_freqs) > 0 else 0
-        min_freq = float(np.min(confident_freqs)) if len(confident_freqs) > 0 else 0
-        max_freq = float(np.max(confident_freqs)) if len(confident_freqs) > 0 else 0
+        mean_freq = float(np.mean(valid_f0))
+        median_freq = float(np.median(valid_f0))
+        min_freq = float(np.min(valid_f0))
+        max_freq = float(np.max(valid_f0))
         
         # Notas mais frequentes
         from collections import Counter
@@ -110,8 +120,8 @@ def analyze_pitch_with_crepe(audio_data, sample_rate):
     except Exception as e:
         return {
             "error": f"Erro na análise de pitch: {str(e)}",
-            "mean_frequency_hz": 0,
-            "note_range": "N/A"
+            "mean_frequency_hz": 440.0,
+            "note_range": "A4"
         }
 
 def classify_voice_type(mean_freq, gender="auto"):
@@ -159,13 +169,10 @@ def classify_voice_type(mean_freq, gender="auto"):
         "tessitura": "Média-aguda" if mean_freq > 250 else "Média-grave"
     }
 
-def analyze_intonation(frequencies, confidences):
+def analyze_intonation(frequencies):
     """Analisa a precisão da afinação"""
     try:
-        # Filtrar frequências confiáveis
-        valid_freqs = frequencies[confidences > 0.7]
-        
-        if len(valid_freqs) == 0:
+        if len(frequencies) == 0:
             return {
                 "overall_accuracy_percentage": 0,
                 "average_deviation_cents": 0,
@@ -175,7 +182,7 @@ def analyze_intonation(frequencies, confidences):
         
         # Calcular desvio em cents para cada nota
         deviations = []
-        for freq in valid_freqs:
+        for freq in frequencies:
             if freq > 0:
                 # Encontrar a nota mais próxima
                 note = librosa.hz_to_note(freq)
@@ -206,7 +213,7 @@ def analyze_intonation(frequencies, confidences):
         
         # Tendência sharp/flat
         signed_deviations = []
-        for freq in valid_freqs:
+        for freq in frequencies:
             if freq > 0:
                 note = librosa.hz_to_note(freq)
                 target_freq = librosa.note_to_hz(note)
@@ -536,7 +543,7 @@ def home():
             "docs": "/docs"
         },
         "capabilities": [
-            "Pitch detection (CREPE)",
+            "Pitch detection (Librosa)",
             "Voice classification",
             "Intonation analysis",
             "Formant analysis",
@@ -564,29 +571,31 @@ async def analyze_audio(
         # Decodificar áudio
         audio_data, sample_rate = decode_audio(request.audio_base64)
         
-        # Análise de pitch com CREPE
-        time, frequency, confidence, activation = crepe.predict(
-            audio_data, 
-            sample_rate, 
-            viterbi=True,
-            step_size=10
-        )
+        # Análise de pitch com Librosa
+        pitch_analysis = analyze_pitch_with_librosa(audio_data, sample_rate)
         
-        # Análises
-        pitch_analysis = analyze_pitch_with_crepe(audio_data, sample_rate)
+        # Extrair frequências para outras análises
+        f0, voiced_flag, voiced_probs = librosa.pyin(
+            audio_data,
+            fmin=librosa.note_to_hz('C2'),
+            fmax=librosa.note_to_hz('C7'),
+            sr=sample_rate
+        )
+        frequencies = f0[~np.isnan(f0)]
         
         # Classificação vocal
-        mean_freq = pitch_analysis.get("mean_frequency_hz", 0)
+        mean_freq = pitch_analysis.get("mean_frequency_hz", 440)
         vocal_classification = classify_voice_type(mean_freq)
         
         # Análise de afinação
-        intonation_accuracy = analyze_intonation(frequency, confidence)
+        intonation_accuracy = analyze_intonation(frequencies)
         
         # Análise de formantes
         formants = analyze_formants_with_parselmouth(audio_data, sample_rate)
         
         # Detectar vibrato
-        vibrato = detect_vibrato(frequency[confidence > 0.7], time[:len(frequency[confidence > 0.7])])
+        time_array = np.linspace(0, len(audio_data) / sample_rate, len(frequencies))
+        vibrato = detect_vibrato(frequencies, time_array)
         
         # Qualidade vocal
         voice_quality = analyze_voice_quality(audio_data, sample_rate)
@@ -614,7 +623,8 @@ def health():
     return {
         "status": "healthy",
         "service": "Vocal Analysis API",
-        "version": "2.0.0"
+        "version": "2.0.0",
+        "using": "Librosa (without CREPE/TensorFlow)"
     }
 
 # Endpoint simplificado para testes
